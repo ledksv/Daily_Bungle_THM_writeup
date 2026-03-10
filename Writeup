@@ -82,7 +82,6 @@ sqlmap -u "http://<TARGET_IP>/index.php?option=com_fields&view=fields&layout=mod
 
 The extracted hash is bcrypt. Save it to a file and crack it with John:
 
-```bash
 john hash --wordlist=/usr/share/wordlists/rockyou.txt
 ```
 
